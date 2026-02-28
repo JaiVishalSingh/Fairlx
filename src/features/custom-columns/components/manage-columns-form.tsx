@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -24,6 +24,8 @@ import { useConfirm } from "@/hooks/use-confirm";
 
 import { useWorkspaceId } from "@/features/workspaces/hooks/use-workspace-id";
 import { useProjectId } from "@/features/projects/hooks/use-project-id";
+import { useGetProject } from "@/features/projects/api/use-get-project";
+import { useGetWorkflowStatuses } from "@/features/workflows/api/use-get-workflow-statuses";
 import { TaskStatus } from "@/features/tasks/types";
 
 import { createCustomColumnBaseSchema } from "../schemas";
@@ -47,6 +49,25 @@ export const ManageColumnsForm = ({ onCancel }: ManageColumnsFormProps) => {
   const workspaceId = useWorkspaceId();
   const projectId = useProjectId();
   const [showCreateForm, setShowCreateForm] = useState(false);
+
+  // Get project to find workflow
+  const { data: project } = useGetProject({ projectId: projectId || "" });
+  
+  // Get workflow statuses for the project's assigned workflow
+  const { data: workflowStatusesData, isLoading: isLoadingWorkflowStatuses } = useGetWorkflowStatuses({
+    workflowId: project?.workflowId || ""
+  });
+
+  // Create a list of workflow-based columns
+  const workflowColumns = useMemo(() => {
+    if (!workflowStatusesData?.documents) return [];
+    return workflowStatusesData.documents.map(status => ({
+      id: status.key as TaskStatus,
+      name: status.name,
+      color: status.color,
+      statusType: status.statusType,
+    }));
+  }, [workflowStatusesData]);
 
   // Track pending changes
   const [pendingColumnToggles, setPendingColumnToggles] = useState<Set<TaskStatus>>(new Set());
@@ -531,56 +552,119 @@ export const ManageColumnsForm = ({ onCancel }: ManageColumnsFormProps) => {
 
           <DottedSeparator />
 
-          {/* Default Columns Section - Only show if we have a projectId */}
+          {/* Default Columns Section - Show workflow statuses if available, fallback to hardcoded defaults */}
           {projectId && (
             <div>
               <div className="flex items-center gap-2 mb-4">
                 <h3 className="text-lg font-semibold">Default Columns</h3>
                 <Badge variant="outline" className="text-xs">
-                  Project-specific
+                  {project?.workflowId ? "From Workflow" : "Project-specific"}
                 </Badge>
               </div>
               <p className="text-sm text-muted-foreground mb-4">
-                Show or hide the default workflow columns for this project. Hidden columns will move all tasks to &ldquo;Todo&rdquo;.
+                {project?.workflowId 
+                  ? "These columns come from your assigned workflow. Show or hide them for this project."
+                  : "Show or hide the default workflow columns for this project. Hidden columns will move all tasks to \"Todo\"."
+                }
               </p>
-              <div className="space-y-3">
-                {defaultColumns.map((column) => {
-                  const isPendingToggle = pendingColumnToggles.has(column.id);
-                  const willBeEnabled = isPendingToggle ? !column.isEnabled : column.isEnabled;
-                  return (
-                    <div
-                      key={column.id}
-                      className={`flex items-center justify-between p-3 rounded-lg border bg-card hover:bg-muted/20 transition-colors ${isPendingToggle ? 'bg-yellow-50 dark:bg-yellow-950/20' : ''}`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="font-medium">{column.name}</span>
-                        <Badge variant={willBeEnabled ? "default" : "secondary"} className="text-xs">
-                          {willBeEnabled ? "Visible" : "Hidden"}
-                        </Badge>
-                        {isPendingToggle && (
-                          <Badge variant="outline" className="text-xs bg-yellow-100 text-yellow-700 border-yellow-200">
-                            Pending Change
-                          </Badge>
-                        )}
-                      </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleToggleDefaultColumn(column.id)}
-                        className={column.isEnabled ? "hover:bg-orange-50 hover:text-orange-700" : "hover:bg-green-50 hover:text-green-700"}
+              
+              {/* Loading state for workflow statuses */}
+              {isLoadingWorkflowStatuses && project?.workflowId && (
+                <div className="flex items-center justify-center py-4">
+                  <div className="text-sm text-muted-foreground">Loading workflow statuses...</div>
+                </div>
+              )}
+              
+              {/* Workflow-based columns (if project has a workflow) */}
+              {project?.workflowId && workflowColumns.length > 0 && (
+                <div className="space-y-3">
+                  {workflowColumns.map((column) => {
+                    const isPendingToggle = pendingColumnToggles.has(column.id);
+                    // Find if this column has an existing default column setting
+                    const existingDefault = defaultColumns.find(dc => dc.id === column.id);
+                    const isEnabled = existingDefault ? existingDefault.isEnabled : true;
+                    const willBeEnabled = isPendingToggle ? !isEnabled : isEnabled;
+                    return (
+                      <div
+                        key={column.id}
+                        className={`flex items-center justify-between p-3 rounded-lg border bg-card hover:bg-muted/20 transition-colors ${isPendingToggle ? 'bg-yellow-50 dark:bg-yellow-950/20' : ''}`}
                       >
-                        {column.isEnabled ? (
-                          <EyeOffIcon className="size-4 mr-2" />
-                        ) : (
-                          <EyeIcon className="size-4 mr-2" />
-                        )}
-                        {column.isEnabled ? "Hide" : "Show"}
-                      </Button>
-                    </div>
-                  );
-                })}
-              </div>
+                        <div className="flex items-center gap-3">
+                          <div
+                            className="size-4 rounded-full border-2 border-white shadow-sm"
+                            style={{ backgroundColor: column.color || '#6B7280' }}
+                          />
+                          <span className="font-medium">{column.name}</span>
+                          <Badge variant={willBeEnabled ? "default" : "secondary"} className="text-xs">
+                            {willBeEnabled ? "Visible" : "Hidden"}
+                          </Badge>
+                          {isPendingToggle && (
+                            <Badge variant="outline" className="text-xs bg-yellow-100 text-yellow-700 border-yellow-200">
+                              Pending Change
+                            </Badge>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleToggleDefaultColumn(column.id)}
+                          className={isEnabled ? "hover:bg-orange-50 hover:text-orange-700" : "hover:bg-green-50 hover:text-green-700"}
+                        >
+                          {isEnabled ? (
+                            <EyeOffIcon className="size-4 mr-2" />
+                          ) : (
+                            <EyeIcon className="size-4 mr-2" />
+                          )}
+                          {isEnabled ? "Hide" : "Show"}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              
+              {/* Fallback to default columns if no workflow or no workflow columns */}
+              {(!project?.workflowId || workflowColumns.length === 0) && !isLoadingWorkflowStatuses && (
+                <div className="space-y-3">
+                  {defaultColumns.map((column) => {
+                    const isPendingToggle = pendingColumnToggles.has(column.id);
+                    const willBeEnabled = isPendingToggle ? !column.isEnabled : column.isEnabled;
+                    return (
+                      <div
+                        key={column.id}
+                        className={`flex items-center justify-between p-3 rounded-lg border bg-card hover:bg-muted/20 transition-colors ${isPendingToggle ? 'bg-yellow-50 dark:bg-yellow-950/20' : ''}`}
+                      >
+                        <div className="flex items-center gap-3">
+                          <span className="font-medium">{column.name}</span>
+                          <Badge variant={willBeEnabled ? "default" : "secondary"} className="text-xs">
+                            {willBeEnabled ? "Visible" : "Hidden"}
+                          </Badge>
+                          {isPendingToggle && (
+                            <Badge variant="outline" className="text-xs bg-yellow-100 text-yellow-700 border-yellow-200">
+                              Pending Change
+                            </Badge>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => handleToggleDefaultColumn(column.id)}
+                          className={column.isEnabled ? "hover:bg-orange-50 hover:text-orange-700" : "hover:bg-green-50 hover:text-green-700"}
+                        >
+                          {column.isEnabled ? (
+                            <EyeOffIcon className="size-4 mr-2" />
+                          ) : (
+                            <EyeIcon className="size-4 mr-2" />
+                          )}
+                          {column.isEnabled ? "Hide" : "Show"}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 

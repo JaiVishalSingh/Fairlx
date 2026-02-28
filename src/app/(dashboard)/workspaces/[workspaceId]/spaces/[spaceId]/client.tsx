@@ -129,9 +129,15 @@ export const SpaceIdClient = () => {
     router.push(`/workspaces/${workspaceId}/projects/${projectId}`);
   };
 
-  const handleWorkflowClick = (projectId: string, e: React.MouseEvent) => {
+  const handleWorkflowClick = (projectId: string, projectWorkflowId: string | undefined, e: React.MouseEvent) => {
     e.stopPropagation();
-    router.push(`/workspaces/${workspaceId}/projects/${projectId}/workflow`);
+    // If project has a workflow assigned, go directly to the workflow editor
+    if (projectWorkflowId) {
+      router.push(`/workspaces/${workspaceId}/spaces/${spaceId}/workflows/${projectWorkflowId}`);
+    } else {
+      // Otherwise, go to the project workflow setup page
+      router.push(`/workspaces/${workspaceId}/projects/${projectId}/workflow`);
+    }
   };
 
   const handleCreateProject = () => {
@@ -341,7 +347,7 @@ export const SpaceIdClient = () => {
                                     size="icon"
                                     variant="ghost"
                                     className="size-7 hover:bg-primary/10 hover:text-primary"
-                                    onClick={(e) => handleWorkflowClick(project.$id, e)}
+                                    onClick={(e) => handleWorkflowClick(project.$id, project.workflowId, e)}
                                   >
                                     <GitBranch className="size-4" />
                                   </Button>

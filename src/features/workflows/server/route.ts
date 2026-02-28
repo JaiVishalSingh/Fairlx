@@ -663,14 +663,23 @@ const app = new Hono()
         return c.json({ error: "Only workspace owners, admins, or space masters can update statuses" }, 403);
       }
 
-      const updatedStatus = await databases.updateDocument<WorkflowStatus>(
-        DATABASE_ID,
-        WORKFLOW_STATUSES_ID,
-        statusId,
-        updates
-      );
+      // Check if status still exists before updating (may have been deleted by sync)
+      try {
+        const updatedStatus = await databases.updateDocument<WorkflowStatus>(
+          DATABASE_ID,
+          WORKFLOW_STATUSES_ID,
+          statusId,
+          updates
+        );
 
-      return c.json({ data: updatedStatus });
+        return c.json({ data: updatedStatus });
+      } catch (error) {
+        // If status was already deleted (e.g., by sync), return gracefully
+        if (error instanceof Error && 'code' in error && (error as unknown as { code: number }).code === 404) {
+          return c.json({ data: null, deleted: true });
+        }
+        throw error;
+      }
     }
   )
 
@@ -1174,13 +1183,231 @@ const app = new Hono()
         return c.json({ error: "Project and workflow must be in the same workspace" }, 400);
       }
 
-      // Update the project to use this workflow
+      // =========================================
+      // Sync project columns -> workflow statuses
+      // Delete workflow statuses that no longer exist in the project
+      // =========================================
+
+      // Get workflow statuses
+      const workflowStatuses = await databases.listDocuments<WorkflowStatus>(
+        DATABASE_ID,
+        WORKFLOW_STATUSES_ID,
+        [Query.equal("workflowId", workflowId), Query.orderAsc("position")]
+      );
+
+      // Get project's customWorkItemTypes (legacy/inline storage)
+      // May be a JSON string or array
+      let projectCustomTypes: Array<{
+        key: string;
+        label: string;
+        icon: string;
+        color: string;
+        visible?: boolean;
+      }> = [];
+      
+      if (project.customWorkItemTypes) {
+        if (typeof project.customWorkItemTypes === 'string') {
+          try {
+            projectCustomTypes = JSON.parse(project.customWorkItemTypes);
+          } catch {
+            projectCustomTypes = [];
+          }
+        } else if (Array.isArray(project.customWorkItemTypes)) {
+          projectCustomTypes = project.customWorkItemTypes;
+        }
+      }
+
+      // Get custom columns from the database
+      const projectCustomColumns = await databases.listDocuments(
+        DATABASE_ID,
+        CUSTOM_COLUMNS_ID,
+        [
+          Query.equal("workspaceId", workflow.workspaceId),
+          Query.equal("projectId", projectId),
+          Query.orderAsc("position"),
+        ]
+      );
+
+      // Get default column settings (to check which columns are hidden/enabled)
+      const defaultColumnSettings = await databases.listDocuments(
+        DATABASE_ID,
+        DEFAULT_COLUMN_SETTINGS_ID,
+        [
+          Query.equal("workspaceId", workflow.workspaceId),
+          Query.equal("projectId", projectId),
+        ]
+      );
+
+      // Build a map of column visibility from default settings
+      const columnVisibility = new Map<string, boolean>();
+      for (const setting of defaultColumnSettings.documents) {
+        columnVisibility.set(setting.columnId, setting.isEnabled);
+      }
+
+      // Default task statuses (always available in projects)
+      const DEFAULT_STATUSES = [
+        { key: "TODO", label: "To Do", color: "#9CA3AF", icon: "Circle" },
+        { key: "ASSIGNED", label: "Assigned", color: "#EF4444", icon: "UserCheck" },
+        { key: "IN_PROGRESS", label: "In Progress", color: "#F59E0B", icon: "Clock" },
+        { key: "IN_REVIEW", label: "In Review", color: "#3B82F6", icon: "Eye" },
+        { key: "DONE", label: "Done", color: "#10B981", icon: "CheckCircle" },
+      ];
+
+      // Build comprehensive list of all project statuses
+      interface ProjectStatus {
+        key: string;
+        name: string;
+        icon: string;
+        color: string;
+        isVisible: boolean;
+      }
+
+      const allProjectStatuses: ProjectStatus[] = [];
+      const seenNames = new Set<string>();
+
+      // 1. Start with default statuses (check visibility from settings)
+      for (const defaultStatus of DEFAULT_STATUSES) {
+        const normalizedName = defaultStatus.label.toLowerCase();
+        const isVisible = columnVisibility.has(defaultStatus.key)
+          ? columnVisibility.get(defaultStatus.key)
+          : true;
+
+        if (!seenNames.has(normalizedName)) {
+          seenNames.add(normalizedName);
+          allProjectStatuses.push({
+            key: defaultStatus.key,
+            name: defaultStatus.label,
+            icon: defaultStatus.icon,
+            color: defaultStatus.color,
+            isVisible: isVisible !== false,
+          });
+        }
+      }
+
+      // 2. Add custom columns from the database
+      for (const col of projectCustomColumns.documents) {
+        const normalizedName = col.name.toLowerCase();
+        const existingIndex = allProjectStatuses.findIndex(
+          s => s.name.toLowerCase() === normalizedName
+        );
+
+        if (existingIndex >= 0) {
+          allProjectStatuses[existingIndex] = {
+            ...allProjectStatuses[existingIndex],
+            icon: col.icon || allProjectStatuses[existingIndex].icon,
+            color: col.color || allProjectStatuses[existingIndex].color,
+          };
+        } else if (!seenNames.has(normalizedName)) {
+          seenNames.add(normalizedName);
+          const normalizeKey = (name: string): string => {
+            return name.toLowerCase().replace(/[\s_-]+/g, "_").toUpperCase();
+          };
+          allProjectStatuses.push({
+            key: normalizeKey(col.name),
+            name: col.name,
+            icon: col.icon || "Circle",
+            color: col.color || "#6B7280",
+            isVisible: true,
+          });
+        }
+      }
+
+      // 3. Update existing statuses with customWorkItemTypes data (for icon/color overrides)
+      // NOTE: We intentionally DON'T add new items from customWorkItemTypes here
+      // because they are legacy/cached data that may have been deleted from the actual columns.
+      // Only use customWorkItemTypes to update visibility/appearance of existing statuses.
+      for (const type of projectCustomTypes) {
+        if (!type.label || typeof type.label !== 'string') continue;
+
+        const normalizedName = type.label.toLowerCase();
+        const existingIndex = allProjectStatuses.findIndex(
+          s => s.name.toLowerCase() === normalizedName
+        );
+
+        // Only update existing statuses, don't add new ones from customWorkItemTypes
+        if (existingIndex >= 0) {
+          allProjectStatuses[existingIndex] = {
+            ...allProjectStatuses[existingIndex],
+            icon: type.icon || allProjectStatuses[existingIndex].icon,
+            color: type.color || allProjectStatuses[existingIndex].color,
+            isVisible: type.visible !== false,
+          };
+        }
+        // Removed: else if (!seenNames.has(normalizedName)) { ... }
+        // We no longer add statuses from customWorkItemTypes that don't exist in defaults or customColumns
+      }
+
+      // Find workflow statuses that don't exist in the project (orphaned)
+      const projectStatusNames = new Set(allProjectStatuses.map(s => s.name.toLowerCase()));
+      const projectStatusKeys = new Set(allProjectStatuses.map(s => s.key));
+
+      const orphanedWorkflowStatuses = workflowStatuses.documents.filter(status => {
+        // Check if this workflow status matches any project status by name or key
+        const matchesByName = projectStatusNames.has(status.name.toLowerCase());
+        const matchesByKey = projectStatusKeys.has(status.key);
+        return !matchesByName && !matchesByKey;
+      });
+
+      let deletedCount = 0;
+
+      if (orphanedWorkflowStatuses.length > 0) {
+        // Get all transitions for this workflow
+        const allTransitions = await databases.listDocuments(
+          DATABASE_ID,
+          WORKFLOW_TRANSITIONS_ID,
+          [Query.equal("workflowId", workflowId)]
+        );
+
+        for (const orphanedStatus of orphanedWorkflowStatuses) {
+          // Delete all transitions to/from this status
+          const relatedTransitions = allTransitions.documents.filter(
+            (t) => t.fromStatusId === orphanedStatus.$id || t.toStatusId === orphanedStatus.$id
+          );
+
+          for (const transition of relatedTransitions) {
+            try {
+              await databases.deleteDocument(
+                DATABASE_ID,
+                WORKFLOW_TRANSITIONS_ID,
+                transition.$id
+              );
+            } catch {
+              // Transition may have already been deleted
+            }
+          }
+
+          // Delete the status
+          try {
+            await databases.deleteDocument(
+              DATABASE_ID,
+              WORKFLOW_STATUSES_ID,
+              orphanedStatus.$id
+            );
+            deletedCount++;
+          } catch {
+            // Status may have already been deleted
+          }
+        }
+      }
+
+      // Clean up stale customWorkItemTypes entries
+      // Only keep entries that match defaults or custom columns
+      const validStatusNames = new Set(allProjectStatuses.map(s => s.name.toLowerCase()));
+      const cleanedCustomTypes = Array.isArray(projectCustomTypes) 
+        ? projectCustomTypes.filter(type => {
+            if (!type.label || typeof type.label !== 'string') return false;
+            return validStatusNames.has(type.label.toLowerCase());
+          })
+        : [];
+
+      // Update the project to use this workflow and clean up customWorkItemTypes
       const updatedProject = await databases.updateDocument(
         DATABASE_ID,
         PROJECTS_ID,
         projectId,
         {
           workflowId: workflowId,
+          customWorkItemTypes: JSON.stringify(cleanedCustomTypes),
         }
       );
 
@@ -1188,6 +1415,7 @@ const app = new Hono()
         data: {
           project: updatedProject,
           workflow: workflow,
+          deletedStatuses: deletedCount,
         },
       });
     }
@@ -1246,13 +1474,26 @@ const app = new Hono()
       }
 
       // Get project's customWorkItemTypes (legacy/inline storage)
-      const projectCustomTypes = (project.customWorkItemTypes || []) as Array<{
+      // May be a JSON string or array
+      let projectCustomTypes: Array<{
         key: string;
         label: string;
         icon: string;
         color: string;
         visible?: boolean;
-      }>;
+      }> = [];
+      
+      if (project.customWorkItemTypes) {
+        if (typeof project.customWorkItemTypes === 'string') {
+          try {
+            projectCustomTypes = JSON.parse(project.customWorkItemTypes);
+          } catch {
+            projectCustomTypes = [];
+          }
+        } else if (Array.isArray(project.customWorkItemTypes)) {
+          projectCustomTypes = project.customWorkItemTypes;
+        }
+      }
 
       // Get custom columns from the database
       const projectCustomColumns = await databases.listDocuments(
@@ -1481,7 +1722,9 @@ const app = new Hono()
           }
         }
 
-        // 3. Add project's customWorkItemTypes (may override or add new ones)
+        // 3. Update existing statuses with customWorkItemTypes data (for icon/color/visibility overrides)
+        // NOTE: We intentionally DON'T add new items from customWorkItemTypes here
+        // because they are legacy/cached data that may have been deleted from the actual columns.
         for (const type of projectCustomTypes) {
           // Skip entries with missing or invalid label
           if (!type.label || typeof type.label !== 'string') {
@@ -1494,6 +1737,7 @@ const app = new Hono()
             s => s.name.toLowerCase() === normalizedName
           );
 
+          // Only update existing statuses, don't add new ones from customWorkItemTypes
           if (existingIndex >= 0) {
             // Update existing status
             allProjectStatuses[existingIndex] = {
@@ -1503,23 +1747,18 @@ const app = new Hono()
               isVisible: type.visible !== false,
               source: "customType",
             };
-          } else if (!seenNames.has(normalizedName)) {
-            // Add as new custom type
-            seenNames.add(normalizedName);
-            allProjectStatuses.push({
-              key: type.key,
-              name: type.label,
-              icon: type.icon || "Circle",
-              color: type.color || "#6B7280",
-              isVisible: type.visible !== false,
-              source: "customType",
-            });
           }
+          // Removed: else if (!seenNames.has(normalizedName)) { ... }
+          // We no longer add statuses from customWorkItemTypes that don't exist in defaults or customColumns
         }
 
         // Track statistics
         let addedCount = 0;
         let updatedCount = 0;
+        let deletedCount = 0;
+
+        // Track matched workflow status IDs to find orphaned statuses later
+        const matchedWorkflowStatusIds = new Set<string>();
 
         // Calculate base canvas position for new statuses
         let maxX = 100;
@@ -1538,6 +1777,8 @@ const app = new Hono()
           );
 
           if (existingWorkflowStatus) {
+            // Track that this workflow status is matched to a project status
+            matchedWorkflowStatusIds.add(existingWorkflowStatus.$id);
             // Status exists in workflow - update visibility based on project
             const shouldBeOnCanvas = projectStatus.isVisible;
             const isCurrentlyOnCanvas =
@@ -1607,13 +1848,73 @@ const app = new Hono()
           }
         }
 
-        // Update project to use this workflow
+        // =========================================
+        // Delete workflow statuses that no longer exist in the project
+        // These are "orphaned" statuses that were previously synced but
+        // have since been deleted from the project
+        // =========================================
+        const orphanedWorkflowStatuses = workflowStatuses.documents.filter(
+          (status) => !matchedWorkflowStatusIds.has(status.$id)
+        );
+
+        if (orphanedWorkflowStatuses.length > 0) {
+          // Get all transitions for this workflow to delete related ones
+          const allTransitions = await databases.listDocuments(
+            DATABASE_ID,
+            WORKFLOW_TRANSITIONS_ID,
+            [Query.equal("workflowId", workflowId)]
+          );
+
+          for (const orphanedStatus of orphanedWorkflowStatuses) {
+            // First, delete all transitions to/from this status
+            const relatedTransitions = allTransitions.documents.filter(
+              (t) => t.fromStatusId === orphanedStatus.$id || t.toStatusId === orphanedStatus.$id
+            );
+
+            for (const transition of relatedTransitions) {
+              try {
+                await databases.deleteDocument(
+                  DATABASE_ID,
+                  WORKFLOW_TRANSITIONS_ID,
+                  transition.$id
+                );
+              } catch {
+                // Transition may have already been deleted, continue
+              }
+            }
+
+            // Then delete the status itself
+            try {
+              await databases.deleteDocument(
+                DATABASE_ID,
+                WORKFLOW_STATUSES_ID,
+                orphanedStatus.$id
+              );
+              deletedCount++;
+            } catch {
+              // Status may have already been deleted, continue
+            }
+          }
+        }
+
+        // Clean up stale customWorkItemTypes entries
+        // Only keep entries that match defaults or custom columns
+        const validStatusNames = new Set(allProjectStatuses.map(s => s.name.toLowerCase()));
+        const cleanedCustomTypes = Array.isArray(projectCustomTypes) 
+          ? projectCustomTypes.filter(type => {
+              if (!type.label || typeof type.label !== 'string') return false;
+              return validStatusNames.has(type.label.toLowerCase());
+            })
+          : [];
+
+        // Update project to use this workflow and clean up customWorkItemTypes
         await databases.updateDocument(
           DATABASE_ID,
           PROJECTS_ID,
           projectId,
           {
             workflowId: workflowId,
+            customWorkItemTypes: JSON.stringify(cleanedCustomTypes),
           }
         );
 
@@ -1623,6 +1924,7 @@ const app = new Hono()
             resolution: "project",
             addedStatuses: addedCount,
             updatedStatuses: updatedCount,
+            deletedStatuses: deletedCount,
           },
         });
       }

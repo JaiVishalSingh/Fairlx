@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   ArrowLeft,
   ArrowRight,
@@ -225,6 +226,7 @@ const RuleCard = ({
 
 export const WorkflowGuideClient = () => {
   const workspaceId = useWorkspaceId();
+  const router = useRouter();
   const [activeSection, setActiveSection] = useState("overview");
 
   const sections = [
@@ -241,10 +243,8 @@ export const WorkflowGuideClient = () => {
       {/* Header */}
       <div className="bg-background border-b px-6 py-4">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" asChild>
-            <Link href={`/workspaces/${workspaceId}`}>
-              <ArrowLeft className="size-4" />
-            </Link>
+          <Button variant="ghost" size="icon" onClick={() => router.back()}>
+            <ArrowLeft className="size-4" />
           </Button>
           <div>
             <h1 className="text-2xl font-bold flex items-center gap-2">

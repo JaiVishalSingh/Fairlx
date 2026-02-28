@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   Sparkles,
   Layers,
+  X,
 } from "lucide-react";
 import {
   ReactFlow,
@@ -95,8 +96,22 @@ const WorkflowEditor = () => {
   const workspaceId = useWorkspaceId();
   const { isAdmin } = useCurrentMember({ workspaceId });
 
-  const { data: workflow, isLoading: workflowLoading } = useGetWorkflow({ workflowId });
+  const { data: workflow, isLoading: workflowLoading, refetch: refetchWorkflow } = useGetWorkflow({ workflowId });
   const { data: projectsData } = useGetProjects({ workspaceId });
+
+  // Track dismissed warnings
+  const [dismissedWarnings, setDismissedWarnings] = useState<Set<string>>(new Set());
+
+  // Auto-sync on page open - refetch workflow data once on mount
+  const hasSyncedOnMount = useRef(false);
+  const hasAutoSyncedProjects = useRef(false);
+  useEffect(() => {
+    if (!hasSyncedOnMount.current && workflowId) {
+      hasSyncedOnMount.current = true;
+      // Refetch workflow data to ensure we have the latest
+      refetchWorkflow();
+    }
+  }, [workflowId, refetchWorkflow]);
   const { mutate: deleteWorkflow, isPending: isDeleting } = useDeleteWorkflow();
   const { mutateAsync: createStatus } = useCreateWorkflowStatus();
   const { mutateAsync: updateStatus } = useUpdateStatus();
@@ -120,6 +135,18 @@ const WorkflowEditor = () => {
     projects.filter(p => p.workflowId === workflowId),
     [projects, workflowId]
   );
+
+  // Auto-sync connected projects on page open to clean up orphaned statuses
+  useEffect(() => {
+    if (!hasAutoSyncedProjects.current && connectedProjects.length > 0 && !workflowLoading) {
+      hasAutoSyncedProjects.current = true;
+      // Sync the first connected project to clean up orphaned workflow statuses
+      const projectToSync = connectedProjects[0];
+      if (projectToSync) {
+        syncFromProject({ param: { workflowId, projectId: projectToSync.$id } });
+      }
+    }
+  }, [connectedProjects, workflowLoading, workflowId, syncFromProject]);
 
   // Fetch teams from ALL connected projects (for transition access control)
   const connectedProjectIds = useMemo(() => 
@@ -709,9 +736,6 @@ const WorkflowEditor = () => {
           <div className="flex-1" />
           <div className="flex items-center gap-2">
             <Badge variant="outline" className="text-xs">
-              {statuses.length} statuses
-            </Badge>
-            <Badge variant="outline" className="text-xs">
               {transitions.length} transitions
             </Badge>
             <Badge variant="outline" className="text-xs">
@@ -777,7 +801,7 @@ const WorkflowEditor = () => {
                   {/* Workflow Warnings */}
                   {workflowWarnings.length > 0 && (
                     <div className="mb-4 space-y-2">
-                      {workflowWarnings.map((warning, index) => (
+                      {workflowWarnings.filter(w => !dismissedWarnings.has(w.type)).map((warning, index) => (
                         <div
                           key={index}
                           className="p-3 bg-yellow-50 dark:bg-yellow-950/30 border border-yellow-200 dark:border-yellow-800/50 rounded-lg"
@@ -792,6 +816,13 @@ const WorkflowEditor = () => {
                                 {warning.statuses.join(", ")}
                               </p>
                             </div>
+                            <button
+                              onClick={() => setDismissedWarnings(prev => new Set([...prev, warning.type]))}
+                              className="p-1 rounded-md hover:bg-yellow-200/50 dark:hover:bg-yellow-800/30 transition-colors"
+                              aria-label="Dismiss warning"
+                            >
+                              <X className="size-4 text-yellow-600 dark:text-yellow-500" />
+                            </button>
                           </div>
                         </div>
                       ))}

@@ -4,7 +4,7 @@ import { ID, Query } from "node-appwrite";
 import { z } from "zod";
 
 import { createSessionClient } from "@/lib/appwrite";
-import { DATABASE_ID, CUSTOM_COLUMNS_ID, PROJECTS_ID, WORKFLOW_STATUSES_ID } from "@/config";
+import { DATABASE_ID, CUSTOM_COLUMNS_ID, PROJECTS_ID, WORKFLOW_STATUSES_ID, WORKFLOW_TRANSITIONS_ID } from "@/config";
 
 import { createCustomColumnSchema, updateCustomColumnSchema } from "../schemas";
 
@@ -199,11 +199,98 @@ const app = new Hono()
 
     const { databases } = await createSessionClient();
 
+    // Get the custom column before deleting to know its name/projectId
+    let columnName: string | null = null;
+    let columnProjectId: string | null = null;
+    
+    try {
+      const customColumn = await databases.getDocument(
+        DATABASE_ID,
+        CUSTOM_COLUMNS_ID,
+        customColumnId
+      );
+      columnName = customColumn.name;
+      columnProjectId = customColumn.projectId;
+    } catch {
+      // Column might not exist, continue with delete attempt
+    }
+
+    // Delete the custom column
     await databases.deleteDocument(
       DATABASE_ID,
       CUSTOM_COLUMNS_ID,
       customColumnId
     );
+
+    // Auto-sync: If this was a project column and the project has a workflow, cleanup the workflow status
+    if (columnName && columnProjectId) {
+      try {
+        // Get the project to check if it has a workflowId
+        const project = await databases.getDocument(
+          DATABASE_ID,
+          PROJECTS_ID,
+          columnProjectId
+        );
+
+        if (project.workflowId) {
+          // Find the matching workflow status by name or key
+          const normalizedKey = columnName.toLowerCase().replace(/[\s_-]+/g, "_").toUpperCase();
+          const matchingStatuses = await databases.listDocuments(
+            DATABASE_ID,
+            WORKFLOW_STATUSES_ID,
+            [
+              Query.equal("workflowId", project.workflowId),
+              Query.or([
+                Query.equal("name", columnName),
+                Query.equal("key", normalizedKey)
+              ])
+            ]
+          );
+
+          // Delete matching workflow statuses and their transitions
+          for (const status of matchingStatuses.documents) {
+            // First, delete all transitions to/from this status
+            const relatedTransitions = await databases.listDocuments(
+              DATABASE_ID,
+              WORKFLOW_TRANSITIONS_ID,
+              [
+                Query.equal("workflowId", project.workflowId),
+                Query.or([
+                  Query.equal("fromStatusId", status.$id),
+                  Query.equal("toStatusId", status.$id)
+                ])
+              ]
+            );
+
+            for (const transition of relatedTransitions.documents) {
+              try {
+                await databases.deleteDocument(
+                  DATABASE_ID,
+                  WORKFLOW_TRANSITIONS_ID,
+                  transition.$id
+                );
+              } catch {
+                // Transition may have already been deleted
+              }
+            }
+
+            // Then delete the workflow status
+            try {
+              await databases.deleteDocument(
+                DATABASE_ID,
+                WORKFLOW_STATUSES_ID,
+                status.$id
+              );
+            } catch {
+              // Status may have already been deleted
+            }
+          }
+        }
+      } catch (syncError) {
+        // Log but don't fail the main operation - column is already deleted
+        console.error("Error cleaning up workflow status after column delete:", syncError);
+      }
+    }
 
     return c.json({ data: { $id: customColumnId } });
   });

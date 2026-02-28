@@ -29,7 +29,13 @@ export const useUpdateStatus = () => {
 
       return await response.json();
     },
-    onSuccess: (_, { param }) => {
+    onSuccess: (data, { param }) => {
+      // If status was deleted during sync, just invalidate without success toast
+      if ((data as { deleted?: boolean }).deleted) {
+        queryClient.invalidateQueries({ queryKey: ["workflow", param.workflowId] });
+        queryClient.invalidateQueries({ queryKey: ["workflow-statuses", param.workflowId] });
+        return;
+      }
       toast.success("Status updated successfully");
       queryClient.invalidateQueries({ queryKey: ["workflow", param.workflowId] });
       queryClient.invalidateQueries({ queryKey: ["workflow-statuses", param.workflowId] });

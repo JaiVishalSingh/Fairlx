@@ -78,6 +78,10 @@ export const useDeleteCustomColumn = (props?: UseDeleteCustomColumnProps) => {
       toast.success("Custom column deleted");
       queryClient.invalidateQueries({ queryKey: ["custom-columns"] });
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      // Also invalidate workflow queries to reflect status deletion in workflow view
+      queryClient.invalidateQueries({ queryKey: ["workflows"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-statuses"] });
       props?.onTasksMoved?.();
     },
     onError: () => {
